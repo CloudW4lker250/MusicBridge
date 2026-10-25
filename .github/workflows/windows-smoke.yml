@@ -1,0 +1,273 @@
+# This is Windows Server hosted-runner smoke, NOT Windows 10/11, no-.NET, UI or WE QA.
+name: Released installer - Windows Server smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Exact released ProductVersion, without v (example: 1.0.0-rc44)'
+        required: true
+        type: string
+        default: '1.0.0-rc44'
+      expected_sha256:
+        description: 'Independently confirmed SHA-256 of that MusicBridgeSetup.exe'
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  installer-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      # No checkout, source upload, repository write, or user-supplied secret.
+      - name: Verify, install, check API, reinstall same version, and quit
+        timeout-minutes: 4
+        shell: pwsh
+        env:
+          MB_VERSION: ${{ inputs.version }}
+          MB_EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $testRoot = Join-Path $env:RUNNER_TEMP 'MusicBridgeHostedSmoke'
+          [IO.Directory]::CreateDirectory($testRoot) | Out-Null
+          $reportPath = Join-Path $testRoot 'result.json'
+          $setup = Join-Path $testRoot 'MusicBridgeSetup.exe'
+          $dataDir = Join-Path $env:LOCALAPPDATA 'MusicBridge'
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs/MusicBridge'
+          $installed = Join-Path $installDir 'MusicBridge.exe'
+          $keyFile = Join-Path $dataDir 'local-api-key.dpapi'
+          $checks = [Collections.Generic.List[object]]::new()
+          $stage = 'initialize'
+          $started = [DateTimeOffset]::UtcNow
+          $deadline = $started.AddSeconds(195)
+          $apiKey = $null
+          $http = $null
+          $mayQuit = $false
+          $failed = $false
+          $report = [ordered]@{
+            schema = 1
+            scope = 'Released binary smoke on GitHub-hosted Windows Server. Not Windows 10/11, clean no-.NET, live UI, media playback, Wallpaper Engine, sleep, DPI, GPU or endurance validation.'
+            startedUtc = $started.ToString('O')
+            runnerImage = $env:ImageOS
+            runnerImageVersion = $env:ImageVersion
+            requestedVersion = $env:MB_VERSION
+            outcome = 'NOT_RUN'
+            checks = @()
+            runtimeObservation = @{ status='NOT_RUN'; fullPathsRecorded=$false }
+            limits = @('System .NET and global security settings are left unchanged.', 'Synthetic data only; no real media session or history growth is required.', 'A missing GUI/session/API may make startup FAIL/BLOCKED and cannot be called a client-Windows pass.', 'Only this sanitized JSON is uploaded; no keys, nonce, raw HTTP bodies, source, installer, app data or logs.')
+          }
+          function Check([string]$id, [bool]$ok, [string]$detail) {
+            $checks.Add([pscustomobject]@{id=$id; status=$(if($ok){'PASS'}else{'FAIL'}); detail=$detail})
+            if (-not $ok) { throw [InvalidOperationException]::new('Controlled smoke assertion failed.') }
+          }
+          function RemainingMillis([int]$cap) {
+            $remaining = [int]($deadline - [DateTimeOffset]::UtcNow).TotalMilliseconds
+            if ($remaining -lt 1000) { throw [TimeoutException]::new('Hosted smoke time budget exhausted.') }
+            return [Math]::Min($cap, $remaining)
+          }
+          function InstalledProcesses {
+            $matches = @()
+            foreach ($process in @(Get-Process -Name MusicBridge -ErrorAction SilentlyContinue)) {
+              try {
+                if ([IO.Path]::GetFullPath($process.MainModule.FileName).Equals([IO.Path]::GetFullPath($installed), [StringComparison]::OrdinalIgnoreCase)) { $matches += $process }
+                else { $process.Dispose() }
+              } catch { $process.Dispose(); throw }
+            }
+            return $matches
+          }
+          function ReadLocalKey {
+            $entropy = [Text.Encoding]::UTF8.GetBytes('MusicBridge.LocalApiAccess.v1')
+            $bytes = [Security.Cryptography.ProtectedData]::Unprotect([IO.File]::ReadAllBytes($keyFile), $entropy, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+            try {
+              if ($bytes.Length -ne 32) { throw [InvalidDataException]::new('Unexpected local key format.') }
+              return [Convert]::ToHexString($bytes)
+            } finally { [Array]::Clear($bytes, 0, $bytes.Length) }
+          }
+          function RequestStatus([bool]$authenticated, [string]$origin = '') {
+            $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, 'http://127.0.0.1:17832/status')
+            try {
+              if ($authenticated) {
+                [void]$request.Headers.TryAddWithoutValidation('X-MusicBridge-Client', '1')
+                [void]$request.Headers.TryAddWithoutValidation('X-MusicBridge-Key', $apiKey)
+              }
+              if ($origin) { [void]$request.Headers.TryAddWithoutValidation('Origin', $origin) }
+              $response = $http.SendAsync($request).GetAwaiter().GetResult()
+              try { return [pscustomobject]@{Code=[int]$response.StatusCode; Body=$response.Content.ReadAsStringAsync().GetAwaiter().GetResult()} }
+              finally { $response.Dispose() }
+            } finally { $request.Dispose() }
+          }
+          function WaitStatus {
+            for ($attempt=0; $attempt -lt 30; $attempt++) {
+              [void](RemainingMillis 1000)
+              try {
+                if (Test-Path -LiteralPath $keyFile) {
+                  $script:apiKey = ReadLocalKey
+                  $response = RequestStatus $true
+                  if ($response.Code -eq 200) {
+                    $body = $response.Body | ConvertFrom-Json
+                    $running = @(InstalledProcesses)
+                    try {
+                      if ($running.Count -eq 1 -and $body.status -ceq 'MusicBridge OK' -and [int]$body.processId -eq $running[0].Id -and $body.version -ceq $env:MB_VERSION) {
+                        return [pscustomobject]@{Pid=$running[0].Id; Version=[string]$body.version}
+                      }
+                    } finally { foreach($process in $running){$process.Dispose()} }
+                  }
+                }
+              } catch { }
+              Start-Sleep -Milliseconds 300
+            }
+            throw [TimeoutException]::new('Authorized status did not identify the expected installed process and version.')
+          }
+          function InstallSameBinary {
+            $process = Start-Process -FilePath $setup -ArgumentList '--install-silent' -PassThru -WindowStyle Hidden
+            try {
+              if (-not $process.WaitForExit((RemainingMillis 60000))) { throw [TimeoutException]::new('Silent installer timed out; GUI/session limitation or startup failure possible.') }
+              if ($process.ExitCode -ne 0) { throw [InvalidOperationException]::new('Silent installer returned a nonzero exit code.') }
+            } finally { $process.Dispose() }
+          }
+          function QuitGracefully {
+            $running = @(InstalledProcesses)
+            try {
+              if ($running.Count -eq 0) { return }
+              $command = Start-Process -FilePath $installed -ArgumentList '--quit' -PassThru -WindowStyle Hidden
+              try { if (-not $command.WaitForExit(10000)) { throw [TimeoutException]::new('Quit command timed out.') } }
+              finally { $command.Dispose() }
+              foreach ($process in $running) { if (-not $process.WaitForExit(15000)) { throw [TimeoutException]::new('Installed app did not exit gracefully.') } }
+            } finally { foreach($process in $running){$process.Dispose()} }
+          }
+          function WriteFixture([string]$name, $value) {
+            [IO.File]::WriteAllText((Join-Path $dataDir $name), (ConvertTo-Json -InputObject $value -Depth 12), [Text.UTF8Encoding]::new($false))
+          }
+          function FileHash([string]$name) { return (Get-FileHash -LiteralPath (Join-Path $dataDir $name) -Algorithm SHA256).Hash }
+          try {
+            $stage = 'validate-inputs'
+            Check 'version-input' ($env:MB_VERSION -cmatch '^\d+\.\d+\.\d+(?:-rc\d+)?$') 'Strict numeric release/rc version; no URL or arbitrary argument input.'
+            Check 'hash-input' ($env:MB_EXPECTED_SHA256 -match '^[0-9A-Fa-f]{64}$') 'Expected hash is exactly 64 hexadecimal characters.'
+            $os = Get-CimInstance Win32_OperatingSystem
+            $report.windows = @{caption=$os.Caption; version=$os.Version; build=$os.BuildNumber; architecture=$os.OSArchitecture; productType=$os.ProductType}
+            Check 'hosted-server-scope' ($env:RUNNER_ENVIRONMENT -eq 'github-hosted' -and [int]$os.ProductType -ne 1) 'Expected standard GitHub-hosted Windows Server runner; never labels this as Windows 10/11.'
+            Check 'fresh-app-profile' (-not (Test-Path -LiteralPath $dataDir) -and -not (Test-Path -LiteralPath $installed) -and @(Get-Process -Name MusicBridge -ErrorAction SilentlyContinue).Count -eq 0) 'No preexisting MusicBridge process, install or user-data directory.'
+            $handler = [Net.Http.HttpClientHandler]::new()
+            $handler.UseProxy = $false
+            $handler.AllowAutoRedirect = $false
+            $http = [Net.Http.HttpClient]::new($handler)
+            $http.Timeout = [TimeSpan]::FromSeconds(1)
+            $stage = 'download-and-verify'
+            $url = 'https://github.com/CloudW4lker250/MusicBridge/releases/download/v' + $env:MB_VERSION + '/MusicBridgeSetup.exe'
+            Invoke-WebRequest -Uri $url -OutFile $setup -TimeoutSec ([Math]::Max(1,[Math]::Floor((RemainingMillis 60000)/1000)))
+            $hash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash
+            $report.installerSha256 = $hash
+            Check 'installer-sha256' ($hash -ieq $env:MB_EXPECTED_SHA256) 'Downloaded binary equals the independently supplied expected SHA-256.'
+            $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($setup)
+            Check 'installer-product-version' ($versionInfo.ProductName -ceq 'MusicBridge' -and $versionInfo.ProductVersion -ceq $env:MB_VERSION) 'EXE ProductName and ProductVersion match the requested release.'
+            $stage = 'first-install'
+            $mayQuit = $true
+            InstallSameBinary
+            $first = WaitStatus
+            Check 'first-install-authorized-status' ($first.Version -ceq $env:MB_VERSION) 'Native authenticated /status JSON identifies exactly one installed process, its PID and expected version.'
+            Check 'installed-binary-hash' ((Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash -ceq $hash) 'Installed executable is exactly the verified released binary.'
+            Check 'unauthenticated-denied' ((RequestStatus $false).Code -eq 403) 'A request without client/key headers receives HTTP 403.'
+            Check 'remote-origin-denied' ((RequestStatus $true 'https://example.com').Code -eq 403) 'Even with the local key, a remote website Origin receives HTTP 403.'
+            $stage = 'seed-synthetic-data'
+            QuitGracefully
+            $entryId = 'cccccccccccccccccccccccccccccccc'
+            $entry = @{Id=$entryId; Title='Synthetic hosted smoke'; Artist='Fixture'; Album=''; Source=''; Started='2026-01-01T00:00:00Z'; Ended='2026-01-01T00:00:02Z'; LastSeen='2026-01-01T00:00:02Z'; ListenedSeconds=1; Duration=3; Outcome='completed'}
+            WriteFixture 'settings.json' @{WelcomeCompleted=$true; CheckUpdatesAutomatically=$false; UpdateFeedUrl=''; StartWithWindows=$false; TaskbarPlayerEnabled=$false; SaveOfflineMedia=$false; RememberWindowPlacement=$false; Language='English'; PreferredPlayer='Auto'; SelectedSourceId=''; WallpaperProjectDirectory=''; UiRefreshIntervalMs=700; ShowTrackNotifications=$false}
+            $tools = @{}
+            $tools[('A'*64)] = @{Lyrics="[00:00.000]Hosted runner smoke fixture`n[00:01.000]Second line"; LyricsSourceUrl=''; AlternativeTitle=''; Bookmarks=@(@{Id=('b'*32);Label='Hosted smoke checkpoint';Position=1.5}); Updated='2026-01-01T00:00:00Z'}
+            WriteFixture 'track-tools.json' $tools
+            WriteFixture 'library.json' @{History=@($entry);Favorites=@($entry);LyricsOffsets=@{'fixture|track|'=0.25};LastSource=''}
+            $process = Start-Process -FilePath $installed -ArgumentList '--background' -PassThru -WindowStyle Hidden
+            $process.Dispose()
+            $before = WaitStatus
+            $settingsBefore = FileHash 'settings.json'
+            $toolsBefore = FileHash 'track-tools.json'
+            $libraryBefore = Get-Content -Raw -LiteralPath (Join-Path $dataDir 'library.json') | ConvertFrom-Json
+            $keyBefore = $apiKey
+            $backupRoot = Join-Path $dataDir 'update-backups'
+            $existingBackups = @(Get-ChildItem -LiteralPath $backupRoot -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+            $stage = 'same-version-reinstall'
+            InstallSameBinary
+            $after = WaitStatus
+            Check 'same-version-reinstall-status' ($after.Pid -ne $before.Pid -and $after.Version -ceq $env:MB_VERSION) 'Same-version reinstall restarted one installed app; authenticated status reports its actual new PID and version.'
+            Check 'reinstalled-binary-hash' ((Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash -ceq $hash) 'Reinstalled executable still equals the verified released binary.'
+            Check 'settings-preserved' ((FileHash 'settings.json') -ceq $settingsBefore) 'Synthetic settings.json remains byte-for-byte unchanged.'
+            Check 'track-tools-preserved' ((FileHash 'track-tools.json') -ceq $toolsBefore) 'Synthetic track-tools.json remains byte-for-byte unchanged.'
+            Check 'local-key-preserved' ($apiKey -ceq $keyBefore) 'Same-user DPAPI connection key survived reinstall; no key value is recorded.'
+            $keyBefore = $null
+            $libraryAfter = Get-Content -Raw -LiteralPath (Join-Path $dataDir 'library.json') | ConvertFrom-Json
+            $oldIds = @($libraryBefore.History | ForEach-Object {$_.Id})
+            $newIds = @($libraryAfter.History | ForEach-Object {$_.Id})
+            $missing = @($oldIds | Where-Object {$_ -notin $newIds})
+            $savedEntry = @($libraryAfter.History | Where-Object {$_.Id -eq $entryId})
+            Check 'history-not-lost' ($missing.Count -eq 0 -and $newIds.Count -ge $oldIds.Count -and $savedEntry.Count -eq 1 -and $savedEntry[0].Title -ceq 'Synthetic hosted smoke' -and $savedEntry[0].ListenedSeconds -eq 1) 'Existing synthetic history entries and their content survive. Growth is allowed, not required without real playback.'
+            $savedFavorite = @($libraryAfter.Favorites | Where-Object {$_.Id -eq $entryId})
+            Check 'favorites-and-offset-preserved' ($savedFavorite.Count -eq 1 -and $savedFavorite[0].Title -ceq 'Synthetic hosted smoke' -and $libraryAfter.LyricsOffsets.'fixture|track|' -eq 0.25) 'Synthetic favorite and lyric offset survive reinstall.'
+            $newBackups = @(Get-ChildItem -LiteralPath $backupRoot -Directory | Where-Object {$_.Name -notin $existingBackups})
+            $backupOk = $false
+            foreach ($backup in $newBackups) {
+              $settingsBackup = Join-Path $backup.FullName 'settings.json'
+              $toolsBackup = Join-Path $backup.FullName 'track-tools.json'
+              if ((Test-Path -LiteralPath $settingsBackup) -and (Test-Path -LiteralPath $toolsBackup)) {
+                if ((Get-FileHash -LiteralPath $settingsBackup -Algorithm SHA256).Hash -ceq $settingsBefore -and (Get-FileHash -LiteralPath $toolsBackup -Algorithm SHA256).Hash -ceq $toolsBefore) { $backupOk = $true }
+              }
+            }
+            Check 'pre-reinstall-backup' $backupOk 'A new automatic update backup contains the pre-reinstall synthetic settings and track-tools bytes.'
+            $stage = 'optional-runtime-observation'
+            try {
+              $process = Get-Process -Id $after.Pid
+              try {
+                $core = @($process.Modules | Where-Object {$_.ModuleName -ieq 'coreclr.dll'})
+                $locationClass = 'not-observed'
+                if ($core.Count -gt 0) {
+                  $path = [IO.Path]::GetFullPath($core[0].FileName)
+                  if ($path.StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()), [StringComparison]::OrdinalIgnoreCase)) { $locationClass='temporary-extraction' }
+                  elseif ($path.StartsWith([IO.Path]::GetFullPath($installDir)+[IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { $locationClass='install-directory' }
+                  elseif ($path -match '[\\/]dotnet[\\/]shared[\\/]') { $locationClass='shared-dotnet' }
+                  else { $locationClass='other' }
+                }
+                $report.runtimeObservation = @{status='INFORMATIONAL'; coreclrObserved=($core.Count -gt 0); locationClass=$locationClass; fullPathsRecorded=$false; provesNoDotNetInstallRequired=$false}
+              } finally { $process.Dispose() }
+            } catch { $report.runtimeObservation=@{status='UNAVAILABLE';fullPathsRecorded=$false;provesNoDotNetInstallRequired=$false} }
+            $stage = 'final-graceful-shutdown'
+            QuitGracefully
+            Check 'graceful-shutdown' (@(InstalledProcesses).Count -eq 0) 'Installed --quit stopped the app without forced termination.'
+            $report.outcome = 'PASS_HOSTED_SERVER_SMOKE'
+          } catch {
+            $failed = $true
+            $report.outcome = 'FAIL_OR_ENVIRONMENT_BLOCKED'
+            $report.failedStage = $stage
+            $report.exceptionType = $_.Exception.GetType().Name
+            # Deliberately omit messages, stack traces, bodies, paths, nonce and key.
+          } finally {
+            if ($mayQuit) {
+              try { QuitGracefully }
+              catch {
+                $failed=$true
+                $report.outcome='FAIL_OR_ENVIRONMENT_BLOCKED'
+                $report.cleanup='Graceful quit did not complete. No process was force-killed; runner teardown is responsible for the ephemeral VM.'
+              }
+            }
+            if ($http) {$http.Dispose()}
+            $apiKey=$null
+            $report.finishedUtc=[DateTimeOffset]::UtcNow.ToString('O')
+            $report.elapsedSeconds=[Math]::Round(([DateTimeOffset]::UtcNow-$started).TotalSeconds,3)
+            $report.checks=@($checks.ToArray())
+            [IO.File]::WriteAllText($reportPath,(ConvertTo-Json -InputObject $report -Depth 12),[Text.UTF8Encoding]::new($false))
+          }
+          Write-Output ('Sanitized result: ' + $report.outcome)
+          if ($failed) { Write-Output ('Stopped at controlled stage: ' + $stage); exit 1 }
+
+      # Official action version follows https://github.com/actions/upload-artifact.
+      - name: Upload sanitized JSON only
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: musicbridge-windows-server-smoke-${{ github.run_id }}
+          path: ${{ runner.temp }}/MusicBridgeHostedSmoke/result.json
+          if-no-files-found: warn
+          retention-days: 7
+
